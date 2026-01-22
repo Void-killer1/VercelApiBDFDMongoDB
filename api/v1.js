@@ -7,90 +7,61 @@ export default async function handler(req, res) {
 
     if (req.method === 'OPTIONS') return res.status(200).end();
 
-    const { mongoUri, userId } = req.query;
+    const { mongoUri, userId, view } = req.query;
 
     if (!mongoUri) {
-        return res.status(400).json({
-            error: "Eksik mongoUri!",
-            ipucu: "Komutun başına $url[encode;...] eklediğinizden emin olun."
-        });
+        return res.status(400).json({ error: "Eksik mongoUri parametresi!" });
     }
 
     let connection;
     try {
-        // Bağlantı kurulumu
-        connection = await mongoose.createConnection(mongoUri, {
-            serverSelectionTimeoutMS: 5000
-        }).asPromise();
+        connection = await mongoose.createConnection(mongoUri, { serverSelectionTimeoutMS: 5000 }).asPromise();
+        const Model = connection.model('Data', new mongoose.Schema({}, { strict: false, collection: 'UserData' }));
 
-        const DynamicSchema = new mongoose.Schema({}, { strict: false, collection: 'UserData' });
-        const Model = connection.model('Data', DynamicSchema);
-
-        // --- MONGODB İSTATİSTİKLERİNİ ÇEK ---
-        const stats = await connection.db.command({ dbStats: 1 });
-        
-        // Ücretsiz Atlas kotası genelde 512MB (536870912 byte)
-        const totalQuota = 512 * 1024 * 1024; 
-        const usedBytes = stats.dataSize + stats.indexSize;
-        const remainingBytes = totalQuota - usedBytes;
-        
-        const storageInfo = {
-            db_adi: stats.db,
-            toplam_kayit: stats.objects,
-            kullanilan_mb: (usedBytes / (1024 * 1024)).toFixed(2) + " MB",
-            kalan_mb: (remainingBytes / (1024 * 1024)).toFixed(2) + " MB",
-            doluluk_orani: "%" + ((usedBytes / totalQuota) * 100).toFixed(2)
-        };
-
-        // --- GET: VERİ ÇEKME VEYA LİSTELEME ---
+        // GET İŞLEMİ
         if (req.method === 'GET') {
             if (userId) {
                 const data = await Model.findOne({ userId });
-                return res.status(200).json({ storage: storageInfo, data: data || { exists: false } });
-            } else {
-                const allData = await Model.find({}).limit(100);
-                return res.status(200).json({ storage: storageInfo, users: allData });
+                return res.status(200).json(data || { exists: false });
             }
+
+            const allUsers = await Model.find({}).limit(100);
+
+            // --- SEÇENEK: HAM VERİ GÖSTERİMİ ---
+            if (view === 'raw') {
+                // Sadece JSON dizisini döndürür (Başında "storage" falan olmaz)
+                return res.status(200).json(allUsers);
+            }
+
+            // Normal detaylı görünüm
+            const stats = await connection.db.command({ dbStats: 1 });
+            return res.status(200).json({
+                storage: {
+                    kullanilan: (stats.dataSize / (1024 * 1024)).toFixed(2) + " MB",
+                    kayit_sayisi: stats.objects
+                },
+                users: allUsers
+            });
         }
 
-        // --- POST: DİNAMİK VERİ KAYDETME ---
+        // POST İŞLEMİ (KAYDETME)
         if (req.method === 'POST') {
-            const payload = { ...req.query };
-            delete payload.mongoUri;
+            const combinedData = { ...req.query, ...req.body };
+            delete combinedData.mongoUri;
+            delete combinedData.view;
 
-            if (!payload.userId) throw new Error("userId parametresi şart!");
-
+            if (!combinedData.userId) throw new Error("userId zorunludur!");
             const updated = await Model.findOneAndUpdate(
-                { userId: payload.userId },
-                { $set: payload },
+                { userId: combinedData.userId },
+                { $set: combinedData },
                 { upsert: true, new: true }
             );
-            return res.status(200).json({ success: true, storage: storageInfo, updated });
-        }
-
-        // --- DELETE: VERİ SİLME ---
-        if (req.method === 'DELETE') {
-            const result = await Model.deleteOne({ userId });
-            return res.status(200).json({ success: true, storage: storageInfo, deletedCount: result.deletedCount });
-        }
-
-    } catch (err) {
-        return res.status(500).json({
-            error: "Hata",
-            detay: err.message,
-            yardim: "IP izni veya URL hatası olabilir."
-        });
-    } finally {
-        if (connection) await connection.close();
-    }
-}
-                { upsert: true, new: true }
-            );
-            await conn.close();
             return res.status(200).json({ success: true, updated });
         }
 
     } catch (err) {
-        return res.status(500).json({ error: "Bağlantı Hatası: " + err.message });
+        return res.status(500).json({ error: "Hata", detay: err.message });
+    } finally {
+        if (connection) await connection.close();
     }
 }
