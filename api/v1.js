@@ -1,97 +1,115 @@
 const mongoose = require('mongoose');
 
 export default async function handler(req, res) {
+    // CORS & Güvenlik Ayarları
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, PUT, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
     if (req.method === 'OPTIONS') return res.status(200).end();
 
-    const { mongoUri, userId, view } = req.query;
+    const { mongoUri, userId, view, action, field, amount } = req.query;
 
-    // 1. AŞAMA: URL BOŞ MU?
-    if (!mongoUri) {
-        return res.status(400).json({
-            hata_tipi: "Girdi Hatası",
-            mesaj: "MongoDB Bağlantı adresi (mongoUri) bulunamadı.",
-            cozum: "Lütfen komutunuza ?mongoUri=... parametresini ekleyin."
-        });
-    }
-
-    // 2. AŞAMA: URL FORMATI DOĞRU MU?
-    if (!mongoUri.startsWith("mongodb")) {
-        return res.status(400).json({
-            hata_tipi: "Format Hatası",
-            mesaj: "Geçersiz MongoDB URL formatı.",
-            detay: "URL 'mongodb://' veya 'mongodb+srv://' ile başlamalıdır.",
-            senin_yazdigin: mongoUri.substring(0, 15) + "..."
-        });
-    }
+    if (!mongoUri) return res.status(400).json({ error: "Kritik: mongoUri eksik!" });
 
     let connection;
     try {
-        // Bağlantı denemesi (Zaman aşımı süresini kısa tuttuk ki bot takılmasın)
+        // 1. Gelişmiş Bağlantı Yönetimi
         connection = await mongoose.createConnection(mongoUri, {
-            serverSelectionTimeoutMS: 5000, 
-            connectTimeoutMS: 5000
+            serverSelectionTimeoutMS: 5000,
+            connectTimeoutMS: 5000,
+            family: 4 // IPv4 zorlaması (bazı ağlarda hız kazandırır)
         }).asPromise();
 
-        const Model = connection.model('Data', new mongoose.Schema({}, { strict: false, collection: 'UserData' }));
+        const DynamicSchema = new mongoose.Schema({}, { strict: false, versionKey: false, collection: 'UserData' });
+        const Model = connection.model('Data', DynamicSchema);
 
+        // --- ÖZELLİK 1: VERİ ÇEKME VE FİLTRELEME (GET) ---
         if (req.method === 'GET') {
             if (userId) {
                 const data = await Model.findOne({ userId });
-                if (!data) return res.status(200).json({ exists: false, mesaj: "Kayıtlı veri yok." });
-                return res.status(200).json(data);
+                return res.status(200).json(data || { exists: false, message: "Kullanıcı bulunamadı" });
             }
-            const allUsers = await Model.find({}).limit(100);
+
+            // Sayfalama ve Limit desteği
+            const limit = parseInt(req.query.limit) || 100;
+            const allUsers = await Model.find({}).limit(limit).sort({ points: -1 }); // Otomatik Puan Sıralı
+
             if (view === 'raw') return res.status(200).json(allUsers);
-            
+
             const stats = await connection.db.command({ dbStats: 1 });
-            return res.status(200).json({ storage: stats, users: allUsers });
+            return res.status(200).json({
+                status: "Online",
+                database: stats.db,
+                storage: {
+                    used: (stats.dataSize / 1024).toFixed(2) + " KB",
+                    objects: stats.objects,
+                    avgObjSize: stats.avgObjSize + " bytes"
+                },
+                users: allUsers
+            });
         }
 
+        // --- ÖZELLİK 2: GELİŞMİŞ VERİ MANİPÜLASYONU (POST) ---
         if (req.method === 'POST') {
-            const combinedData = { ...req.query, ...req.body };
-            delete combinedData.mongoUri;
-            if (!combinedData.userId) throw new Error("POST işleminde userId zorunludur.");
-            
+            const bodyData = { ...req.query, ...req.body };
+            delete bodyData.mongoUri;
+            if (!bodyData.userId) throw new Error("userId parametresi zorunludur.");
+
+            // Sayısal Değerleri Otomatik Düzelte (Sıralama hatasını önler)
+            for (let key in bodyData) {
+                if (!isNaN(bodyData[key]) && bodyData[key] !== "") {
+                    bodyData[key] = Number(bodyData[key]);
+                }
+            }
+
+            // Özel Aksiyon: Matematiksel Artırma (Örn: Puan Ekleme)
+            if (action === 'add' && field && amount) {
+                const incUpdate = await Model.findOneAndUpdate(
+                    { userId: bodyData.userId },
+                    { $inc: { [field]: Number(amount) } },
+                    { upsert: true, new: true }
+                );
+                return res.status(200).json({ success: true, updated: incUpdate });
+            }
+
+            // Standart Güncelleme
             const updated = await Model.findOneAndUpdate(
-                { userId: combinedData.userId },
-                { $set: combinedData },
+                { userId: bodyData.userId },
+                { $set: bodyData },
                 { upsert: true, new: true }
             );
             return res.status(200).json({ success: true, data: updated });
         }
 
+        // --- ÖZELLİK 3: VERİ SİLME (DELETE) ---
+        if (req.method === 'DELETE') {
+            if (userId === 'ALL_DATA_RESET_CONFIRM') {
+                await Model.deleteMany({});
+                return res.status(200).json({ success: true, message: "Tüm veritabanı sıfırlandı." });
+            }
+            const result = await Model.deleteOne({ userId });
+            return res.status(200).json({ success: true, deletedCount: result.deletedCount });
+        }
+
     } catch (err) {
-        // 3. AŞAMA: DERİN HATA ANALİZİ
-        let rapor = {
-            hata_tipi: "Bağlantı/Sistem Hatası",
-            teknik_kod: err.code || "Özel Hata",
-            mesaj: err.message,
-            teshis: "Bilinmeyen bir hata oluştu."
+        // --- ÖZELLİK 4: 360 DERECE HATA TEŞHİSİ ---
+        const errorResponse = {
+            error: true,
+            type: err.name,
+            msg: err.message,
+            diagnosis: "Bilinmeyen sistem hatası."
         };
 
-        if (err.message.includes("bad auth") || err.message.includes("Authentication failed")) {
-            rapor.teshis = "MongoDB Kullanıcı adı veya Şifre hatalı!";
-            rapor.cozum = "Database Access kısmından şifreyi sıfırlayın ve URL'yi güncelleyin.";
-        } 
-        else if (err.message.includes("ETIMEOUT") || err.message.includes("selection timeout")) {
-            rapor.teshis = "Sunucuya ulaşılamıyor (Zaman Aşımı).";
-            rapor.cozum = "MongoDB Atlas > Network Access kısmından IP iznini 0.0.0.0/0 (Erişilebilir) yapın.";
-        }
-        else if (err.message.includes("ENOTFOUND")) {
-            rapor.teshis = "Cluster adresi hatalı.";
-            rapor.cozum = "MongoDB URL'sindeki host kısmını (cluster0.xxx.mongodb.net) kontrol edin.";
-        }
-        else if (err.message.includes("invalid driver option")) {
-            rapor.teshis = "URL parametreleri hatalı.";
-            rapor.cozum = "URL sonundaki ?authSource=admin gibi kısımları kontrol edin.";
+        if (err.message.includes("bad auth")) {
+            errorResponse.diagnosis = "MongoDB kullanıcı adı veya şifresi yanlış.";
+        } else if (err.code === "ETIMEOUT" || err.message.includes("timeout")) {
+            errorResponse.diagnosis = "Bağlantı zaman aşımına uğradı. IP izni (0.0.0.0/0) eksik olabilir.";
+        } else if (err.message.includes("is not a valid") || err.name === "BSONError") {
+            errorResponse.diagnosis = "MongoDB URL formatı bozuk veya geçersiz karakter içeriyor.";
         }
 
-        return res.status(500).json(rapor);
-
+        return res.status(500).json(errorResponse);
     } finally {
         if (connection) await connection.close();
     }
